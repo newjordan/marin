@@ -1162,6 +1162,35 @@ def summary(ctx, job_id: str, json_output: bool) -> None:
     click.echo(_render_job_summary_text(result))
 
 
+@job.command("cpu-time")
+@click.argument("job_id")
+@click.option(
+    "--include-failed",
+    is_flag=True,
+    default=False,
+    help="Include all tasks with timestamps, not just succeeded ones.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON instead of a human-readable string.")
+@click.pass_context
+def cpu_time(ctx, job_id: str, include_failed: bool, json_output: bool) -> None:
+    """Print the total task wall-clock time across all leaf jobs in a subtree.
+
+    For a leaf job (no children), the value is the sum of (finished_at -
+    started_at) over its tasks. For a parent job, the value is the sum across
+    all descendant leaf jobs. By default only SUCCEEDED tasks are counted;
+    pass --include-failed to count all tasks with recorded start and finish
+    timestamps.
+    """
+    controller_url = require_controller_url(ctx)
+    client = IrisClient.remote(controller_url, workspace=Path.cwd(), token_provider=ctx.obj.get("token_provider"))
+    job_name = JobName.from_wire(job_id)
+    cpu_wall_ms = client.job_cpu_time(job_name, include_failed=include_failed)
+    if json_output:
+        click.echo(json.dumps({"job_id": job_id, "cpu_wall_ms": cpu_wall_ms, "include_failed": include_failed}))
+        return
+    click.echo(f"CPU wall time: {_format_duration_ms(cpu_wall_ms)} ({cpu_wall_ms} ms)")
+
+
 @job.command("logs")
 @click.argument("job_id")
 @click.option("--since-ms", type=int, default=None, help="Only show logs after this epoch millisecond timestamp.")

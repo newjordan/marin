@@ -584,6 +584,26 @@ message Controller {
     repeated PendingTaskBucket pending_buckets = 6;
     repeated RunningTaskBucket running_buckets = 7;
   }
+
+  // --- CPU Wall Time ---
+
+  // Compute the sum of task wall-clock times across all leaf jobs in the
+  // subtree rooted at job_id. Leaf jobs are jobs with no child jobs; their
+  // contribution is SUM(finished_at_ms - started_at_ms) over their tasks.
+  // Parent jobs contribute the sum of their children's values recursively,
+  // so the result equals the total task wall time across all leaf jobs.
+  message GetJobCpuTimeRequest {
+    string job_id = 1;
+    // When true, include tasks in all terminal states (failed, killed, etc.).
+    // When false (default), only SUCCEEDED tasks are counted.
+    bool include_failed = 2;
+  }
+
+  message GetJobCpuTimeResponse {
+    // Sum of (finished_at_ms - started_at_ms) across all qualifying tasks in
+    // all leaf jobs of the subtree. Zero if no tasks have completed.
+    int64 cpu_wall_ms = 1;
+  }
 }
 
 // ============================================================================
@@ -661,6 +681,9 @@ service ControllerService {
 
   // Scheduler state (dashboard)
   rpc GetSchedulerState(Controller.GetSchedulerStateRequest) returns (Controller.GetSchedulerStateResponse);
+
+  // CPU wall time aggregated across all leaf-job tasks in a subtree
+  rpc GetJobCpuTime(Controller.GetJobCpuTimeRequest) returns (Controller.GetJobCpuTimeResponse);
 
   // Worker-to-controller task status push
   rpc UpdateTaskStatus(Controller.UpdateTaskStatusRequest) returns (Controller.UpdateTaskStatusResponse);

@@ -702,4 +702,16 @@ class Controller(_message.Message):
         pending_buckets: _containers.RepeatedCompositeFieldContainer[Controller.PendingTaskBucket]
         running_buckets: _containers.RepeatedCompositeFieldContainer[Controller.RunningTaskBucket]
         def __init__(self, user_budgets: _Optional[_Iterable[_Union[Controller.SchedulerUserBudget, _Mapping]]] = ..., total_pending: _Optional[int] = ..., total_running: _Optional[int] = ..., pending_buckets: _Optional[_Iterable[_Union[Controller.PendingTaskBucket, _Mapping]]] = ..., running_buckets: _Optional[_Iterable[_Union[Controller.RunningTaskBucket, _Mapping]]] = ...) -> None: ...
+    class GetJobCpuTimeRequest(_message.Message):
+        __slots__ = ("job_id", "include_failed")
+        JOB_ID_FIELD_NUMBER: _ClassVar[int]
+        INCLUDE_FAILED_FIELD_NUMBER: _ClassVar[int]
+        job_id: str
+        include_failed: bool
+        def __init__(self, job_id: _Optional[str] = ..., include_failed: _Optional[bool] = ...) -> None: ...
+    class GetJobCpuTimeResponse(_message.Message):
+        __slots__ = ("cpu_wall_ms",)
+        CPU_WALL_MS_FIELD_NUMBER: _ClassVar[int]
+        cpu_wall_ms: int
+        def __init__(self, cpu_wall_ms: _Optional[int] = ...) -> None: ...
     def __init__(self) -> None: ...

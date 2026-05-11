@@ -121,6 +121,9 @@ class ControllerService(Protocol):
     async def get_scheduler_state(self, request: controller__pb2.Controller.GetSchedulerStateRequest, ctx: RequestContext) -> controller__pb2.Controller.GetSchedulerStateResponse:
         raise ConnectError(Code.UNIMPLEMENTED, "Not implemented")
 
+    async def get_job_cpu_time(self, request: controller__pb2.Controller.GetJobCpuTimeRequest, ctx: RequestContext) -> controller__pb2.Controller.GetJobCpuTimeResponse:
+        raise ConnectError(Code.UNIMPLEMENTED, "Not implemented")
+
     async def update_task_status(self, request: controller__pb2.Controller.UpdateTaskStatusRequest, ctx: RequestContext) -> controller__pb2.Controller.UpdateTaskStatusResponse:
         raise ConnectError(Code.UNIMPLEMENTED, "Not implemented")
 
@@ -472,6 +475,16 @@ class ControllerServiceASGIApplication(ConnectASGIApplication[ControllerService]
                         idempotency_level=IdempotencyLevel.UNKNOWN,
                     ),
                     function=svc.get_scheduler_state,
+                ),
+                "/iris.cluster.ControllerService/GetJobCpuTime": Endpoint.unary(
+                    method=MethodInfo(
+                        name="GetJobCpuTime",
+                        service_name="iris.cluster.ControllerService",
+                        input=controller__pb2.Controller.GetJobCpuTimeRequest,
+                        output=controller__pb2.Controller.GetJobCpuTimeResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                    ),
+                    function=svc.get_job_cpu_time,
                 ),
                 "/iris.cluster.ControllerService/UpdateTaskStatus": Endpoint.unary(
                     method=MethodInfo(
@@ -1186,6 +1199,26 @@ class ControllerServiceClient(ConnectClient):
             timeout_ms=timeout_ms,
         )
 
+    async def get_job_cpu_time(
+        self,
+        request: controller__pb2.Controller.GetJobCpuTimeRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None,
+        timeout_ms: int | None = None,
+    ) -> controller__pb2.Controller.GetJobCpuTimeResponse:
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetJobCpuTime",
+                service_name="iris.cluster.ControllerService",
+                input=controller__pb2.Controller.GetJobCpuTimeRequest,
+                output=controller__pb2.Controller.GetJobCpuTimeResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+
     async def update_task_status(
         self,
         request: controller__pb2.Controller.UpdateTaskStatusRequest,
@@ -1295,6 +1328,8 @@ class ControllerServiceSync(Protocol):
     def list_user_budgets(self, request: controller__pb2.Controller.ListUserBudgetsRequest, ctx: RequestContext) -> controller__pb2.Controller.ListUserBudgetsResponse:
         raise ConnectError(Code.UNIMPLEMENTED, "Not implemented")
     def get_scheduler_state(self, request: controller__pb2.Controller.GetSchedulerStateRequest, ctx: RequestContext) -> controller__pb2.Controller.GetSchedulerStateResponse:
+        raise ConnectError(Code.UNIMPLEMENTED, "Not implemented")
+    def get_job_cpu_time(self, request: controller__pb2.Controller.GetJobCpuTimeRequest, ctx: RequestContext) -> controller__pb2.Controller.GetJobCpuTimeResponse:
         raise ConnectError(Code.UNIMPLEMENTED, "Not implemented")
     def update_task_status(self, request: controller__pb2.Controller.UpdateTaskStatusRequest, ctx: RequestContext) -> controller__pb2.Controller.UpdateTaskStatusResponse:
         raise ConnectError(Code.UNIMPLEMENTED, "Not implemented")
@@ -1645,6 +1680,16 @@ class ControllerServiceWSGIApplication(ConnectWSGIApplication):
                         idempotency_level=IdempotencyLevel.UNKNOWN,
                     ),
                     function=service.get_scheduler_state,
+                ),
+                "/iris.cluster.ControllerService/GetJobCpuTime": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="GetJobCpuTime",
+                        service_name="iris.cluster.ControllerService",
+                        input=controller__pb2.Controller.GetJobCpuTimeRequest,
+                        output=controller__pb2.Controller.GetJobCpuTimeResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                    ),
+                    function=service.get_job_cpu_time,
                 ),
                 "/iris.cluster.ControllerService/UpdateTaskStatus": EndpointSync.unary(
                     method=MethodInfo(
@@ -2353,6 +2398,26 @@ class ControllerServiceClientSync(ConnectClientSync):
                 service_name="iris.cluster.ControllerService",
                 input=controller__pb2.Controller.GetSchedulerStateRequest,
                 output=controller__pb2.Controller.GetSchedulerStateResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+
+    def get_job_cpu_time(
+        self,
+        request: controller__pb2.Controller.GetJobCpuTimeRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None,
+        timeout_ms: int | None = None,
+    ) -> controller__pb2.Controller.GetJobCpuTimeResponse:
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetJobCpuTime",
+                service_name="iris.cluster.ControllerService",
+                input=controller__pb2.Controller.GetJobCpuTimeRequest,
+                output=controller__pb2.Controller.GetJobCpuTimeResponse,
                 idempotency_level=IdempotencyLevel.UNKNOWN,
             ),
             headers=headers,

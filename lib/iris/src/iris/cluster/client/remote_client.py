@@ -446,6 +446,27 @@ class RemoteClusterClient:
 
         return call_with_retry(f"list_tasks({job_id})", _call)
 
+    def get_job_cpu_time(self, job_id: JobName, *, include_failed: bool = False) -> int:
+        """Return sum of task wall-clock times (ms) across all leaf jobs in the subtree.
+
+        Args:
+            job_id: Root job ID of the subtree to aggregate.
+            include_failed: When True, include all tasks with timestamps. When False
+                (default), only SUCCEEDED tasks are counted.
+
+        Returns:
+            Total cpu_wall_ms across all qualifying leaf-job tasks.
+        """
+
+        def _call():
+            request = controller_pb2.Controller.GetJobCpuTimeRequest(
+                job_id=job_id.to_wire(),
+                include_failed=include_failed,
+            )
+            return self._client.get_job_cpu_time(request).cpu_wall_ms
+
+        return call_with_retry(f"get_job_cpu_time({job_id})", _call)
+
     def fetch_logs(
         self,
         source: str,

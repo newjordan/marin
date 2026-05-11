@@ -803,6 +803,41 @@ def _task_summaries_for_jobs(q: QuerySnapshot, job_ids: set[JobName]) -> dict[Jo
     return summaries
 
 
+def _leaf_cpu_wall_ms(q: QuerySnapshot, job_id: JobName, *, include_failed: bool) -> int:
+    """Sum task wall-clock times across all leaf jobs in the subtree rooted at job_id.
+
+    Leaf jobs are jobs with no child jobs. For each leaf job the contribution
+    is SUM(finished_at_ms - started_at_ms) over qualifying tasks. Parent jobs
+    contribute the sum of their children's values recursively, so the result
+    equals the total task wall time across all leaf-job tasks in the subtree.
+
+    When include_failed is False (default), only TASK_STATE_SUCCEEDED tasks
+    are counted. When True, all tasks with both timestamps present are counted.
+    """
+    state_filter = "" if include_failed else f"AND t.state = {job_pb2.TASK_STATE_SUCCEEDED}"
+    sql = f"""
+        WITH RECURSIVE descendants(job_id) AS (
+            SELECT job_id FROM jobs WHERE job_id = ?
+            UNION ALL
+            SELECT j.job_id FROM jobs j
+            JOIN descendants d ON j.parent_job_id = d.job_id
+        ),
+        leaves(job_id) AS (
+            SELECT d.job_id FROM descendants d
+            WHERE NOT EXISTS (SELECT 1 FROM jobs c WHERE c.parent_job_id = d.job_id)
+        )
+        SELECT COALESCE(SUM(t.finished_at_ms - t.started_at_ms), 0) AS cpu_wall_ms
+        FROM tasks t
+        JOIN leaves l ON t.job_id = l.job_id
+        WHERE t.started_at_ms IS NOT NULL
+          AND t.finished_at_ms IS NOT NULL
+          AND t.finished_at_ms > t.started_at_ms
+          {state_filter}
+    """
+    rows = q.raw(sql, (job_id.to_wire(),))
+    return int(rows[0].cpu_wall_ms) if rows else 0
+
+
 def _worker_roster(store: ControllerStore) -> list[WorkerDetailRow]:
     with store.read_snapshot() as q:
         decoded = WORKER_DETAIL_PROJECTION.decode(
@@ -2614,6 +2649,21 @@ class ControllerServiceImpl:
             pending_buckets=pending_buckets,
             running_buckets=running_buckets,
         )
+
+    def get_job_cpu_time(
+        self,
+        request: controller_pb2.Controller.GetJobCpuTimeRequest,
+        ctx: Any,
+    ) -> controller_pb2.Controller.GetJobCpuTimeResponse:
+        """Return the sum of task wall-clock times across all leaf jobs in the subtree."""
+        require_identity()
+        job_name = JobName.from_wire(request.job_id)
+        with self._db.read_snapshot() as q:
+            job = _read_job(q, job_name)
+            if not job:
+                raise ConnectError(Code.NOT_FOUND, f"Job {request.job_id} not found")
+            cpu_wall_ms = _leaf_cpu_wall_ms(q, job_name, include_failed=request.include_failed)
+        return controller_pb2.Controller.GetJobCpuTimeResponse(cpu_wall_ms=cpu_wall_ms)
 
     # --- Worker Push ---
 

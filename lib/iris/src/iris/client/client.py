@@ -723,6 +723,19 @@ class IrisClient:
         """
         self._cluster_client.terminate_job(job_id)
 
+    def job_cpu_time(self, job_id: JobName, *, include_failed: bool = False) -> int:
+        """Return sum of task wall-clock times (ms) across all leaf jobs in the subtree.
+
+        Args:
+            job_id: Root job ID of the subtree to aggregate.
+            include_failed: When True, count all tasks with timestamps; when False
+                (default), only SUCCEEDED tasks are counted.
+
+        Returns:
+            Total cpu_wall_ms for the subtree.
+        """
+        return self._cluster_client.get_job_cpu_time(job_id, include_failed=include_failed)
+
     def list_jobs(
         self,
         *,
