@@ -2214,15 +2214,10 @@ class Controller:
                 req.attempt_id = row.attempt_id
                 starts[row.worker_id].append(req)
                 attempt_by_worker_task[(row.worker_id, row.task_id.to_wire())] = row.attempt_id
-            # ASSIGNED rows go into ``expected`` too so PollTasks reports
-            # current state. The worker's BUILDING push is best-effort
-            # (worker.py:_on_state_change drops RPC failures); poll is the
-            # only resilient recovery channel for ASSIGNED -> BUILDING.
-            # Per-worker reconcile (see ``WorkerProvider._reconcile_one``)
-            # sends StartTasks then PollTasks under one stub, so by the time
-            # PollTasks lands the worker's task table already contains the
-            # rows we just dispatched and ``_missing_task_status`` cannot
-            # auto-kill them.
+            # ASSIGNED rows go into ``expected`` so the worker fetches the
+            # spec via GetTaskAttemptInfo on the next poll and submits it.
+            # The worker's BUILDING push is best-effort, so poll is the only
+            # resilient recovery channel for ASSIGNED -> BUILDING.
             expected[row.worker_id].append(RunningTaskEntry(task_id=row.task_id, attempt_id=row.attempt_id))
 
         # ── Phase 2: per-worker reconcile under a single asyncio loop ────

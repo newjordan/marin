@@ -211,13 +211,10 @@ class WorkerProvider:
         sem: asyncio.Semaphore,
         plan: "WorkerReconcilePlan",
     ) -> "WorkerReconcileResult":
-        """Per-worker reconcile: StartTasks (if any) followed by PollTasks.
-
-        Order matters within a single worker — the worker's task table must
-        be populated by the dispatch before PollTasks lands, otherwise the
-        worker's ``_missing_task_status`` path would auto-kill freshly
-        dispatched tasks. Different workers run independently under the
-        shared semaphore.
+        """Per-worker reconcile: StartTasks (compat no-op stub) followed by
+        PollTasks, which is where the worker actually fetches and submits
+        expected tasks via GetTaskAttemptInfo. Workers run concurrently
+        under the shared semaphore.
         """
         async with sem:
             if not plan.address:

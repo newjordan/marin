@@ -810,6 +810,29 @@ class ControllerTransitions:
         self._health = health or WorkerHealthTracker()
         self._run_template_cache: _LRUCache[str, job_pb2.RunTaskRequest] = _LRUCache(RUN_REQUEST_TEMPLATE_CACHE_SIZE)
 
+    def run_request_for_attempt(
+        self,
+        snap: QuerySnapshot | TransactionCursor,
+        task_id: JobName,
+        attempt_id: int,
+    ) -> job_pb2.RunTaskRequest | None:
+        """Build the per-attempt ``RunTaskRequest`` for ``(task_id, attempt_id)``.
+
+        Returns ``None`` if the task's job has no dispatchable form
+        (reservation holder, missing job row).
+        """
+        job_id = self._store.tasks.get_job_id(snap, task_id)
+        if job_id is None:
+            return None
+        template = self.run_request_template(snap, job_id)
+        if template is None:
+            return None
+        req = job_pb2.RunTaskRequest()
+        req.CopyFrom(template)
+        req.task_id = task_id.to_wire()
+        req.attempt_id = attempt_id
+        return req
+
     def run_request_template(
         self,
         snap: QuerySnapshot | TransactionCursor,
