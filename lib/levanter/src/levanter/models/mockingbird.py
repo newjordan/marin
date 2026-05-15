@@ -1,43 +1,45 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Mockingbird architecture (partial smoke-port from Parameter Golf).
+"""Mockingbird architecture (partial port from Parameter Golf).
 
 Source: parameter-golf-lab/records/track_10min_16mb/2026-05-01_Mockingbird_8xH100/train_gpt.py
 (reference run: 11L x 512, mlp_mult=3.75, 1.062 BPB val on FineWeb 10B at 600s/16MB).
 
-FAITHFUL TO REFERENCE:
+FAITHFUL TO REFERENCE (Phase 1a complete):
 - leaky_relu(neg_slope=0.5)^2 MLP (NOT gated SwiGLU): hidden = leaky_relu(up_proj(x), 0.5)^2; down_proj(hidden)
 - Per-block attn_scale, mlp_scale (per-dim learnable scalar gains on residual updates)
-- RMSNorm pre-norm
-- Tied embeddings
-- Global scalar QK gain via AttentionConfig.scaling_factor = qk_gain / sqrt(head_dim)
-- 11L x 512 dim 8 heads mlp_mult=3.75 defaults
-- ln_scale_factor = 1/sqrt(layer_idx+1) (when ln_scale=True)
+- RMSNorm pre-norm + QK rmsnorm pre-RoPE (via AttentionConfig.qk_norm)
+- Tied embeddings, num_kv_heads=4 (GQA 8:4)
+- Per-head learnable QK gain Param of shape (kv_head, q_heads_per_group),
+  init 5.25, applied to q after RoPE (MockingbirdAttention)
+- Partial RoPE: rotates first `rope_dims` of head dim only, rest pass-through,
+  via zero-padded inv_freq (PartialRotaryEmbeddings)
+- Logit softcap on LM head (cap*tanh(logits/cap))
 
 NOT YET PORTED (TODO, in roughly the order to add them):
-- Per-head learnable QK gain (reference: nn.Parameter((num_heads,), qk_gain_init=5.25)).
-  Current port uses a single scalar via AttentionConfig.scaling_factor.
-- resid_mix: per-dim learnable 2-vec that mixes current x with embedding x0 at each block.
-  Requires plumbing x0 through the layer scan; not in Llama's signature today.
+- ln_scale: norm output multiplied by 1/sqrt(layer_idx+1). Needs layer index
+  plumbing through the layer Stacked.
+- resid_mix: per-block Param (2,dim) mixes current x with embedding x0:
+  x_in = mix[0]*x + mix[1]*x0. Needs x0 plumbing through fold kwargs.
+- Smear gate: x_t += lam*sigmoid(W*x_t[:12]) * x_{t-1}, BOS-masked, after embed.
 - U-Net encoder/decoder skip connections with learnable skip_weights + skip_gates.
-  Reference uses skip from encoder layer i to decoder layer N-i-1.
-- Looped middle block (loop_start=3, loop_end=5, num_loops=2, enable_looping_at=0.45).
-  Implementation plan: split layers into pre/loop/post Stacked blocks, with a
-  step-conditional lax.cond toggling the loop.
-- Logit softcap on the LM head.
-- yarn rope, rope_dims.
-- Forward-1 token smear of the embedding lane.
+- Looped middle block (loop_start=3, loop_end=5, num_loops=2, always-on for
+  the port; reference toggles at 0.45 of training).
+- Parallel lanes: decoder layers >= parallel_start_layer run a 2-lane block.
+- Sparse attention gate (W_g (num_heads, gate_window=12), scale 0.5, on SDPA out).
+- XSA: orthogonal value projection on attn output (`_xsa_efficient`), all layers.
 
-The smoke target is: init, forward, backward all work on CPU with TinyStories.
+Smoke target: init, forward, backward all work on GPU with TinyStories.
 """
 
 import dataclasses
-import math
 from dataclasses import dataclass
 from typing import Optional, Type, cast
 
 import equinox as eqx
+import jax
+import jax.numpy as jnp
 import jax.random as jrandom
 
 import haliax as hax
@@ -48,8 +50,18 @@ from haliax.nn.scan import BlockFoldable, BlockSeq, ScanCheckpointPolicy, Stacke
 from haliax.state_dict import ModuleWithStateDictSerialization
 
 from levanter.layers import LayerNormConfigBase, RmsNormConfig
-from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask
-from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
+from levanter.layers.attention import (
+    Attention,
+    AttentionBackend,
+    AttentionConfig,
+    AttentionMask,
+    dot_product_attention,
+)
+from levanter.layers.rotary import (
+    DefaultRotaryEmbeddingsConfig,
+    RotaryEmbeddings,
+    RotaryEmbeddingsConfig,
+)
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.flop_utils import lm_flops_per_token
 
@@ -61,6 +73,90 @@ def _leaky_relu_squared(x: NamedArray, negative_slope: float = 0.5) -> NamedArra
     """
     y = hax.where(x > 0, x, x * negative_slope)
     return y * y
+
+
+def _rotate_half(x: NamedArray, HeadSize: Axis) -> NamedArray:
+    """Mirror of levanter.layers.rotary._rotate_half (private upstream).
+
+    Rotates the second half of HeadSize to negate-and-prepend.
+    """
+    x1 = x[HeadSize, : HeadSize.size // 2]
+    x2 = x[HeadSize, HeadSize.size // 2 :]
+    return hax.concatenate(HeadSize, (-x2, x1))
+
+
+@dataclass(frozen=True)
+class PartialRotaryEmbeddingsConfig(RotaryEmbeddingsConfig):
+    """Rotate only the first ``rope_dims`` of the head dim; pass the rest through.
+
+    Implementation: standard RoPE inv_freq for the active band, then zero-pad
+    the inactive band so cos(0)=1 and sin(0)=0 leave those dims unchanged
+    after the q*cos + rotate_half(q)*sin combine.
+
+    Reference: PG train_gpt.py uses rope_dims=16 on head_size=64 (rotate the
+    first quarter only). This is a static-config knob — once chosen at init
+    it does not change during training.
+    """
+
+    theta: float = 10000.0
+    rope_dims: int = 16
+
+    def build(self, HeadSize: Axis) -> RotaryEmbeddings:
+        if self.rope_dims <= 0 or self.rope_dims > HeadSize.size:
+            raise ValueError(
+                f"rope_dims={self.rope_dims} must be in (0, {HeadSize.size}] for HeadSize={HeadSize.size}."
+            )
+        if self.rope_dims % 2 != 0:
+            raise ValueError(f"rope_dims={self.rope_dims} must be even.")
+        if (HeadSize.size - self.rope_dims) % 2 != 0:
+            raise ValueError(
+                f"HeadSize.size - rope_dims = {HeadSize.size - self.rope_dims} must be even."
+            )
+        return PartialRotaryEmbeddings(HeadSize, self.rope_dims, self)
+
+    @classmethod
+    def make_from_hf_config(cls, rope_theta: float, config: dict) -> "RotaryEmbeddingsConfig":
+        return PartialRotaryEmbeddingsConfig(theta=rope_theta, rope_dims=config.get("rope_dims", 16))
+
+    def to_hf_config(self) -> tuple[float, dict | None]:
+        return self.theta, {"rope_type": "partial", "rope_dims": self.rope_dims}
+
+
+# Register so draccus can dispatch by name; safe re-registration is a no-op.
+try:
+    RotaryEmbeddingsConfig.register_subclass("partial", PartialRotaryEmbeddingsConfig)
+except Exception:
+    pass
+
+
+class PartialRotaryEmbeddings(RotaryEmbeddings):
+    HeadDim: Axis = eqx.field(static=True)
+    rope_dims: int = eqx.field(static=True)
+    config: PartialRotaryEmbeddingsConfig = eqx.field(static=True)
+
+    def __call__(self, q: NamedArray, position_ids: NamedArray) -> NamedArray:
+        with jax.ensure_compile_time_eval():
+            head_dim = self.HeadDim.size
+            ActiveHalf = self.HeadDim.resize(self.rope_dims // 2)
+            inv_freq_active: NamedArray = 1.0 / (
+                self.config.theta ** (hax.arange(ActiveHalf, step=2) / self.rope_dims)
+            )
+            HalfHead = self.HeadDim.resize(head_dim // 2)
+            if self.rope_dims < head_dim:
+                PassiveHalf = self.HeadDim.resize((head_dim - self.rope_dims) // 2)
+                zero_pad = hax.zeros(PassiveHalf)
+                # Rename slices to share an axis so concatenate works on HalfHead.
+                inv_freq_active_h = inv_freq_active.rename({ActiveHalf.name: HalfHead.name})
+                zero_pad_h = zero_pad.rename({PassiveHalf.name: HalfHead.name})
+                inv_freq = hax.concatenate(HalfHead, (inv_freq_active_h, zero_pad_h))
+            else:
+                inv_freq = inv_freq_active.rename({ActiveHalf.name: HalfHead.name})
+
+        freqs = inv_freq.broadcast_axis(position_ids.axes) * position_ids
+        emb = hax.concatenate(self.HeadDim, (freqs, freqs))
+        cos = hax.cos(emb).astype(q.dtype)
+        sin = hax.sin(emb).astype(q.dtype)
+        return q * cos + _rotate_half(q, self.HeadDim) * sin
 
 
 @LmConfig.register_subclass("mockingbird")
@@ -165,10 +261,16 @@ class MockingbirdConfig(LmConfig):
         return self.norm_config.build(axis)
 
     def attention_config(self) -> AttentionConfig:
-        # Scalar QK gain folded into scaling_factor (default 1/sqrt(head_dim) * qk_gain).
-        # TODO Phase 2: replace with per-head learnable Param applied to Q after RoPE.
-        # qk_norm = RMSNorm on Q,K before RoPE (reference: F.rms_norm on each).
-        scaling = self.qk_gain / math.sqrt(self.head_size)
+        # qk_norm = RMSNorm on Q,K pre-RoPE (Levanter applies it inside _compute_qkv
+        # before the rope call — verified at attention.py:1828-1836). Per-head QK gain
+        # lives on MockingbirdAttention as a Param applied to q post-RoPE; the
+        # remaining 1/sqrt(head_size) scaling is left to dot_product_attention's
+        # default (scaling_factor=None).
+        rope_cfg: RotaryEmbeddingsConfig
+        if 0 < self.rope_dims < self.head_size:
+            rope_cfg = PartialRotaryEmbeddingsConfig(theta=10000.0, rope_dims=self.rope_dims)
+        else:
+            rope_cfg = self.rope
         return AttentionConfig(
             Embed=self.Embed,
             num_heads=self.num_heads,
@@ -178,8 +280,8 @@ class MockingbirdConfig(LmConfig):
             upcast_attn=self.upcast_attn,
             attn_backend=self.attn_backend,
             flash_attention_block_size=self.flash_attention_block_size,
-            rope=self.rope,
-            scaling_factor=scaling,
+            rope=rope_cfg,
+            scaling_factor=None,
             qk_norm=self.norm_config,
         )
 
@@ -228,6 +330,87 @@ class MockingbirdMlp(eqx.Module):
         return self.down_proj(h, key=k_down)
 
 
+class MockingbirdAttention(Attention):
+    """Levanter Attention + per-head learnable QK gain Param applied to q post-RoPE.
+
+    The base class (configured with ``qk_norm``) handles QK rmsnorm pre-RoPE
+    and RoPE; we add a learnable Param of shape (KVHeads, QHeadsPerGroup) that
+    multiplies q after RoPE and before the SDPA call. This replaces the scalar
+    ``AttentionConfig.scaling_factor`` and matches PG ``train_gpt.py`` per-head
+    qk_gain (init 5.25).
+    """
+
+    # Defaults to None to satisfy dataclass field ordering (parent has defaulted
+    # fields). init() always supplies the actual Param.
+    per_head_qk_gain: Optional[NamedArray] = None
+
+    @staticmethod
+    def init(
+        config: AttentionConfig, qk_gain_init: float, *, key
+    ) -> "MockingbirdAttention":
+        base = Attention.init(config, key=key)
+        per_head_qk_gain = hax.full(
+            (config.KVHeads, config.QHeadsPerGroup), qk_gain_init
+        )
+        return MockingbirdAttention(
+            base.config,
+            base.q_proj,
+            base.k_proj,
+            base.v_proj,
+            base.o_proj,
+            base.q_norm,
+            base.k_norm,
+            base.rot_embs,
+            per_head_qk_gain,
+        )
+
+    @named_call
+    def __call__(
+        self,
+        x: NamedArray,
+        mask: Optional[NamedArray | AttentionMask],
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+    ) -> NamedArray:
+        key_proj, key_o = maybe_rng_split(key, 2)
+        q, k, v = self._compute_qkv(x, key=key_proj, pos_ids=pos_ids)
+
+        q = q.rearrange((..., "kv_head", "q_heads_per_group", "position", "head_size"))
+        k = k.rearrange((..., "kv_head", "position", "head_size"))
+        v = v.rearrange((..., "kv_head", "position", "head_size"))
+        k = k.rename({"position": "key_position"})
+        v = v.rename({"position": "key_position"})
+
+        # Per-head QK gain applied to q (post-RoPE, pre-SDPA). The remaining
+        # 1/sqrt(head_size) scaling is handled by dot_product_attention via
+        # config.scaling_factor (None -> default 1/sqrt(head_size)).
+        q = q * self.per_head_qk_gain
+
+        if self.config.sliding_window is not None and isinstance(mask, AttentionMask):
+            mask = mask.with_sliding_window(self.config.sliding_window)
+
+        attn_output = dot_product_attention(
+            "position",
+            "key_position",
+            "head_size",
+            q,
+            k,
+            v,
+            mask,
+            attention_dtype=jnp.float32 if self.config.upcast_attn else x.dtype,
+            attn_backend=self.config.attn_backend,
+            flash_block_size=self.config.flash_attention_block_size,
+            scaling_factor=self.config.scaling_factor,
+            logits_soft_cap=self.config.logits_soft_cap,
+            inference=True,
+            prng=key,
+        )
+        attn_output = attn_output.flatten_axes(("kv_head", "q_heads_per_group"), "heads")
+        attn_output = attn_output.astype(x.dtype)
+        return self.o_proj(attn_output, key=key_o)
+
+
 class MockingbirdBlock(eqx.Module):
     """Pre-norm transformer block with per-block per-dim attn/mlp residual scales.
 
@@ -242,7 +425,7 @@ class MockingbirdBlock(eqx.Module):
     """
 
     config: MockingbirdConfig = eqx.field(static=True)
-    self_attn: Attention
+    self_attn: MockingbirdAttention
     mlp: MockingbirdMlp
     attn_norm: hnn.RmsNorm
     mlp_norm: hnn.RmsNorm
@@ -253,7 +436,7 @@ class MockingbirdBlock(eqx.Module):
     def init(config: MockingbirdConfig, *, key) -> "MockingbirdBlock":
         k_attn, k_mlp = jrandom.split(key, 2)
         attn_config = config.attention_config()
-        attn = Attention.init(attn_config, key=k_attn)
+        attn = MockingbirdAttention.init(attn_config, qk_gain_init=config.qk_gain, key=k_attn)
         mlp = MockingbirdMlp.init(
             config.Embed,
             config.Mlp,
