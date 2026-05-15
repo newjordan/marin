@@ -339,6 +339,44 @@ class MockingbirdMlp(eqx.Module):
         return self.down_proj(h, key=k_down)
 
 
+class SmearGate(eqx.Module):
+    """Forward-1-token smear right after the embedding norm.
+
+    Reference (PG train_gpt.py): for each position t, add a learned-gated copy
+    of the previous-token embedding back into the current position:
+
+        x_t += lam * sigmoid(W @ x_t[:smear_window]) * x_{t-1}
+
+    Position 0 has no prior token (BOS-masked, shift contribution = 0). lam
+    inits at 0 so initial behavior is identity.
+    """
+
+    config: MockingbirdConfig = eqx.field(static=True)
+    proj: hnn.Linear  # In=(smear_in, smear_window), Out=Embed
+    lam: NamedArray   # 0-d learnable scalar
+
+    @staticmethod
+    def init(config: MockingbirdConfig, *, key) -> "SmearGate":
+        SmearAxis = Axis("smear_in", config.smear_window)
+        proj = hnn.Linear.init(In=SmearAxis, Out=config.Embed, key=key, use_bias=False, out_first=True)
+        lam = hax.named(jnp.zeros((), dtype=jnp.float32), ())
+        return SmearGate(config, proj, lam)
+
+    @named_call
+    def __call__(self, x: NamedArray) -> NamedArray:
+        Embed = self.config.Embed
+        Pos = self.config.Pos
+        SmearAxis = Axis("smear_in", self.config.smear_window)
+        # First smear_window dims of embed -> rename axis to smear_in for the projection.
+        x_first = x[Embed, : self.config.smear_window].rename({Embed.name: SmearAxis.name})
+        gate = hnn.sigmoid(self.proj(x_first))  # (..., position, embed)
+        # x_{t-1}: roll then BOS-mask position 0 (roll is wrap-around).
+        x_prev = hax.roll(x, shift=1, axis=Pos)
+        bos_mask = (hax.arange(Pos) > 0).astype(x.dtype)
+        x_prev = x_prev * bos_mask
+        return x + self.lam * gate * x_prev
+
+
 class MockingbirdAttention(Attention):
     """Levanter Attention + per-head learnable QK gain Param applied to q post-RoPE.
 
@@ -535,6 +573,7 @@ class MockingbirdTransformer(eqx.Module):
     dec_layers: BlockFoldable[MockingbirdBlock]
     final_norm: hnn.RmsNorm
     embed_norm: Optional[hnn.RmsNorm]
+    smear_gate: Optional[SmearGate]
     # U-Net skip Params, axis ("dec_layer", n_dec).
     # First n_dec_skipless slots stay dormant (zero gradient) because the
     # corresponding skip slice is also zero — see __call__'s skip_for_dec build.
@@ -567,7 +606,7 @@ class MockingbirdTransformer(eqx.Module):
         LoopAxis = Axis("loop_layer", n_loop)
         DecAxis = Axis("dec_layer", n_dec)
 
-        k_enc, k_loop, k_dec = jrandom.split(key, 3)
+        k_enc, k_loop, k_dec, k_smear = jrandom.split(key, 4)
 
         enc_layers = S.init(EncAxis, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
             config, enc_factors, key=shaped_rng_split(k_enc, n_enc),
@@ -597,9 +636,10 @@ class MockingbirdTransformer(eqx.Module):
 
         final_norm = config.mk_LayerNorm(config.Embed)
         embed_norm = config.mk_LayerNorm(config.Embed) if config.embed_norm else None
+        smear_gate = SmearGate.init(config, key=k_smear) if config.smear_gate_enabled else None
         return MockingbirdTransformer(
             config, enc_layers, loop_layers, dec_layers, final_norm, embed_norm,
-            skip_weights, skip_gate_logits,
+            smear_gate, skip_weights, skip_gate_logits,
         )
 
     @named_call
@@ -623,10 +663,12 @@ class MockingbirdTransformer(eqx.Module):
         else:
             keys_enc = keys_loop = keys_dec = None
 
-        # x0 = post-norm embedding, broadcast to every block via fold kwargs
-        # so each block's resid_mix can mix the original embedding back in.
+        # x0 = post-norm (post-smear) embedding, broadcast to every block via fold
+        # kwargs so each block's resid_mix can mix the original embedding back in.
         if self.embed_norm is not None:
             x = self.embed_norm(x)
+        if self.smear_gate is not None:
+            x = self.smear_gate(x)
         x0 = x
 
         # ─── Encoder ────────────────────────────────────────────────────────
