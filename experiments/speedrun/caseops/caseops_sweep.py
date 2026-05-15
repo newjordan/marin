@@ -47,8 +47,9 @@ from marin.datakit.canonical.fineweb_edu import download as fineweb_edu_download
 from marin.execution.executor import executor_main
 
 from experiments.defaults import default_tokenize
-from experiments.llama import llama3_tokenizer_vocab_size, llama_150m
+from experiments.llama import llama3_tokenizer_vocab_size
 from experiments.marin_models import marin_tokenizer
+from experiments.private.mockingbird_caseops_preflight import mockingbird_150m
 from experiments.simple_train_config import SimpleTrainConfig
 from experiments.speedrun.caseops.submission_support import Author, SpeedrunConfig, default_speedrun
 
@@ -65,7 +66,7 @@ AUTHOR = Author(
 )
 
 VOCAB = 32000  # CaseOps + control vocab size (baseline is fixed at llama3's ~128K)
-MODEL_CONFIG = llama_150m  # identical architecture across all 3 arms
+MODEL_CONFIG = mockingbird_150m  # Mockingbird-150m (Phase 1-4 ported); identical across arms
 
 # Same documents for every arm. Scoped to the sample/10BT subset (14 parquet
 # shards, ~17 GB) — fineweb_edu_download() with no glob would pull the entire
