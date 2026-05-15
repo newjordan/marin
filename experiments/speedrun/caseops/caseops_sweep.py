@@ -78,9 +78,12 @@ RAW_SOURCE = (
     .cd("sample/10BT")
 )
 
-# Single rented A100-80G. fray's DEVICE_FLOPS knows "a100-80g", so speedrun_results
-# gets honest hardware-FLOPS accounting with no fray patch.
-RESOURCES: ResourceConfig = ResourceConfig.with_gpu("A100-80G", count=1)
+# Single rented GPU. fray detects the device via "auto" — note that flops
+# accounting in speedrun_results is only honest when fray's DEVICE_FLOPS table
+# knows the device (a100-80g, h100, etc.). For exotic cards (e.g. RTX PRO 6000
+# Blackwell as of 2026-05-15) the flops field will be zero/default; the loss
+# curve and bpb are still honest, just the perf-vs-flops Pareto point isn't.
+RESOURCES: ResourceConfig = ResourceConfig.with_gpu("auto", count=1, cpu=8, ram="64G", disk="64G")
 
 TRAIN_BATCH_SIZE = 128
 # Env override exists so a tiny preflight and the real run share one file.
@@ -92,13 +95,15 @@ LEARNING_RATE = 3e-3
 # pass (no repeats) while keeping tokenization bounded for all 3 arms.
 TOKENIZE_SAMPLE_COUNT = int(os.environ.get("CASEOPS_TOKENIZE_SAMPLE_COUNT", "90000"))
 
-# Tokenizer references. Local dirs (Marin's load_tokenizer handles dirs directly).
-# See OPEN ITEMS — for a portable submission these may become HF repo refs.
-_ARTIFACTS = pathlib.Path(__file__).resolve().parents[2] / "private" / "caseops" / "artifacts"
+# Tokenizer references. Pushed to private HF repos as standalone top-level
+# tokenizers (NOT subfolders) because Marin's levanter.tokenizers.load_tokenizer
+# doesn't accept subfolder syntax. See experiments/private/caseops/push_to_hf.py
+# for the multi-variant umbrella repo (Frosty40/caseops-marin-tokenizers); the
+# specific 32k variants are split out so any fresh box can pull them directly.
 TOKENIZERS = {
-    "baseline": marin_tokenizer,  # the speedrun default, ~128K
-    "control": str(_ARTIFACTS / f"plain_{VOCAB}"),
-    "treatment": str(_ARTIFACTS / f"caseops_{VOCAB}_wrapped"),
+    "baseline": marin_tokenizer,                    # the speedrun default, ~128K
+    "control":  "Frosty40/marin-plain-32000",       # plain byte-level BPE
+    "treatment": "Frosty40/marin-caseops-32000",    # CaseOps lossless-caps wrapped
 }
 VOCAB_SIZES = {
     "baseline": llama3_tokenizer_vocab_size,
