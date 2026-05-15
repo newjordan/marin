@@ -553,6 +553,43 @@ class MockingbirdBlock(eqx.Module):
         return x
 
 
+class MockingbirdParallelBlock(eqx.Module):
+    """2-lane decoder block: two independent MockingbirdBlock lanes share input,
+    outputs are averaged.
+
+    Reference (PG train_gpt.py): for decoder layers >= parallel_start_layer,
+    each layer runs two parallel sub-blocks with their own attn/mlp/norms;
+    the lanes' outputs are averaged. Doubles params per layer but the
+    averaging tends to stabilize the deep decoder during pretraining.
+    """
+
+    config: MockingbirdConfig = eqx.field(static=True)
+    lane1: MockingbirdBlock
+    lane2: MockingbirdBlock
+
+    @staticmethod
+    def init(config: MockingbirdConfig, ln_scale_factor: jax.Array, *, key) -> "MockingbirdParallelBlock":
+        k1, k2 = jrandom.split(key, 2)
+        lane1 = MockingbirdBlock.init(config, ln_scale_factor, key=k1)
+        lane2 = MockingbirdBlock.init(config, ln_scale_factor, key=k2)
+        return MockingbirdParallelBlock(config, lane1, lane2)
+
+    @named_call
+    def __call__(
+        self,
+        x: NamedArray,
+        mask: Optional[NamedArray | AttentionMask],
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+        x0: NamedArray | None = None,
+    ) -> NamedArray:
+        k1, k2 = maybe_rng_split(key, 2)
+        out1 = self.lane1(x, mask, key=k1, pos_ids=pos_ids, x0=x0)
+        out2 = self.lane2(x, mask, key=k2, pos_ids=pos_ids, x0=x0)
+        return (out1 + out2) * 0.5
+
+
 class MockingbirdTransformer(eqx.Module):
     """Mockingbird custom transformer skeleton.
 
@@ -570,13 +607,17 @@ class MockingbirdTransformer(eqx.Module):
     config: MockingbirdConfig = eqx.field(static=True)
     enc_layers: BlockFoldable[MockingbirdBlock]
     loop_layers: BlockFoldable[MockingbirdBlock]
-    dec_layers: BlockFoldable[MockingbirdBlock]
+    # Regular decoder layers (loop_end+1 .. parallel_start_layer). Empty when
+    # parallel_start_layer == loop_end+1.
+    dec_reg_layers: Optional[BlockFoldable[MockingbirdBlock]]
+    # Parallel-lane decoder layers (parallel_start_layer .. num_layers).
+    # Empty when parallel_start_layer >= num_layers.
+    dec_par_layers: Optional[BlockFoldable[MockingbirdParallelBlock]]
     final_norm: hnn.RmsNorm
     embed_norm: Optional[hnn.RmsNorm]
     smear_gate: Optional[SmearGate]
-    # U-Net skip Params, axis ("dec_layer", n_dec).
-    # First n_dec_skipless slots stay dormant (zero gradient) because the
-    # corresponding skip slice is also zero — see __call__'s skip_for_dec build.
+    # U-Net skip Params, axis ("dec_layer", n_dec_total). Sliced into reg/par
+    # halves at use-time (see __call__).
     skip_weights: Optional[NamedArray]
     skip_gate_logits: Optional[NamedArray]
 
@@ -584,14 +625,20 @@ class MockingbirdTransformer(eqx.Module):
     def init(config: MockingbirdConfig, *, key) -> "MockingbirdTransformer":
         n_enc = config.loop_start
         n_loop = config.loop_end - config.loop_start + 1
-        n_dec = config.num_layers - config.loop_end - 1
-        n_skip_pairs = min(n_enc, n_dec) if config.use_unet_skips else 0
-        n_dec_skipless = n_dec - n_skip_pairs
+        n_dec_total = config.num_layers - config.loop_end - 1
+        # Decoder split point: layers >= parallel_start_layer use the 2-lane
+        # parallel block. parallel_start_layer is a global layer index, so we
+        # shift it into the decoder-local frame.
+        psl = max(config.parallel_start_layer, config.loop_end + 1)
+        n_dec_par = max(0, config.num_layers - psl)
+        n_dec_reg = n_dec_total - n_dec_par
+        n_skip_pairs = min(n_enc, n_dec_total) if config.use_unet_skips else 0
+        n_dec_skipless = n_dec_total - n_skip_pairs
 
         # Precompute per-layer ln_scale_factor across the FULL contiguous index
         # range (encoder gets 0..n_enc-1, loop gets n_enc..n_enc+n_loop-1, etc.).
-        # Note: every loop rep reuses the same ln_factors[loop_range] — that's
-        # the looped-middle parameter-sharing semantics.
+        # Loop reps reuse the same ln_factors[loop_range] -> parameter sharing
+        # across reps is the looped-middle hallmark.
         idx = jnp.arange(config.num_layers, dtype=jnp.float32)
         if config.ln_scale:
             ln_factors = 1.0 / jnp.sqrt(idx + 1.0)
@@ -599,14 +646,17 @@ class MockingbirdTransformer(eqx.Module):
             ln_factors = jnp.ones(config.num_layers, dtype=jnp.float32)
         enc_factors = ln_factors[:n_enc]
         loop_factors = ln_factors[n_enc : n_enc + n_loop]
-        dec_factors = ln_factors[n_enc + n_loop :]
+        dec_reg_factors = ln_factors[n_enc + n_loop : n_enc + n_loop + n_dec_reg]
+        dec_par_factors = ln_factors[n_enc + n_loop + n_dec_reg :]
 
         S = Stacked if config.scan_layers else BlockSeq
         EncAxis = Axis("enc_layer", n_enc)
         LoopAxis = Axis("loop_layer", n_loop)
-        DecAxis = Axis("dec_layer", n_dec)
+        DecRegAxis = Axis("dec_reg_layer", n_dec_reg) if n_dec_reg > 0 else None
+        DecParAxis = Axis("dec_par_layer", n_dec_par) if n_dec_par > 0 else None
+        DecAxis = Axis("dec_layer", n_dec_total)  # for the combined skip Params
 
-        k_enc, k_loop, k_dec, k_smear = jrandom.split(key, 4)
+        k_enc, k_loop, k_dec_reg, k_dec_par, k_smear = jrandom.split(key, 5)
 
         enc_layers = S.init(EncAxis, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
             config, enc_factors, key=shaped_rng_split(k_enc, n_enc),
@@ -614,12 +664,24 @@ class MockingbirdTransformer(eqx.Module):
         loop_layers = S.init(LoopAxis, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
             config, loop_factors, key=shaped_rng_split(k_loop, n_loop),
         )
-        dec_layers = S.init(DecAxis, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
-            config, dec_factors, key=shaped_rng_split(k_dec, n_dec),
-        )
+        if n_dec_reg > 0:
+            dec_reg_layers = S.init(DecRegAxis, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
+                config, dec_reg_factors, key=shaped_rng_split(k_dec_reg, n_dec_reg),
+            )
+        else:
+            dec_reg_layers = None
+        if n_dec_par > 0:
+            dec_par_layers = S.init(
+                DecParAxis, MockingbirdParallelBlock, gradient_checkpointing=config.gradient_checkpointing
+            )(
+                config, dec_par_factors, key=shaped_rng_split(k_dec_par, n_dec_par),
+            )
+        else:
+            dec_par_layers = None
 
         if config.use_unet_skips and n_skip_pairs > 0:
-            # Per-decoder-layer Params; skipless slots init at "off" sentinel.
+            # Per-decoder-layer Params over the COMBINED dec range; skipless slots
+            # init at "off" sentinel. Sliced to reg/par halves at forward time.
             sw = jnp.concatenate([
                 jnp.zeros(n_dec_skipless, dtype=jnp.float32),
                 jnp.ones(n_skip_pairs, dtype=jnp.float32),
@@ -638,8 +700,8 @@ class MockingbirdTransformer(eqx.Module):
         embed_norm = config.mk_LayerNorm(config.Embed) if config.embed_norm else None
         smear_gate = SmearGate.init(config, key=k_smear) if config.smear_gate_enabled else None
         return MockingbirdTransformer(
-            config, enc_layers, loop_layers, dec_layers, final_norm, embed_norm,
-            smear_gate, skip_weights, skip_gate_logits,
+            config, enc_layers, loop_layers, dec_reg_layers, dec_par_layers,
+            final_norm, embed_norm, smear_gate, skip_weights, skip_gate_logits,
         )
 
     @named_call
@@ -653,15 +715,19 @@ class MockingbirdTransformer(eqx.Module):
     ) -> NamedArray:
         n_enc = self.config.loop_start
         n_loop = self.config.loop_end - self.config.loop_start + 1
-        n_dec = self.config.num_layers - self.config.loop_end - 1
+        n_dec_total = self.config.num_layers - self.config.loop_end - 1
+        psl = max(self.config.parallel_start_layer, self.config.loop_end + 1)
+        n_dec_par = max(0, self.config.num_layers - psl)
+        n_dec_reg = n_dec_total - n_dec_par
 
         if key is not None:
-            k_enc, k_loop, k_dec = jrandom.split(key, 3)
+            k_enc, k_loop, k_dec_reg, k_dec_par = jrandom.split(key, 4)
             keys_enc = maybe_rng_split(k_enc, n_enc)
             keys_loop = maybe_rng_split(k_loop, n_loop)
-            keys_dec = maybe_rng_split(k_dec, n_dec)
+            keys_dec_reg = maybe_rng_split(k_dec_reg, n_dec_reg) if n_dec_reg > 0 else None
+            keys_dec_par = maybe_rng_split(k_dec_par, n_dec_par) if n_dec_par > 0 else None
         else:
-            keys_enc = keys_loop = keys_dec = None
+            keys_enc = keys_loop = keys_dec_reg = keys_dec_par = None
 
         # x0 = post-norm (post-smear) embedding, broadcast to every block via fold
         # kwargs so each block's resid_mix can mix the original embedding back in.
@@ -699,27 +765,26 @@ class MockingbirdTransformer(eqx.Module):
                 self.loop_layers.fold(x, mask=attn_mask, key=keys_loop, pos_ids=pos_ids, x0=x0),
             )
 
-        # ─── Decoder ────────────────────────────────────────────────────────
+        # ─── Decoder (split into reg / par halves; both consume the same
+        # combined skip stack, sliced by half) ─────────────────────────────
         if self.skip_weights is not None and enc_outs is not None:
-            # Build skip_for_dec aligned with decoder iteration order:
+            # skip_for_dec aligned with the COMBINED decoder iteration order:
             #   first n_dec_skipless slots = zero (no skip),
-            #   last n_skip_pairs slots    = enc_outs reversed (last enc -> first paired dec).
-            n_skip_pairs = min(n_enc, n_dec)
-            n_dec_skipless = n_dec - n_skip_pairs
-            DecAxis = self.dec_layers.Block
-            # Reverse along EncAxis via underlying jnp; rename axis to dec_layer.
-            enc_outs_arr = enc_outs.array  # axes: (enc_layer, ..., position, embed)
+            #   last n_skip_pairs slots    = enc_outs reversed.
+            n_skip_pairs = min(n_enc, n_dec_total)
+            n_dec_skipless = n_dec_total - n_skip_pairs
+            enc_outs_arr = enc_outs.array
             enc_outs_flipped = jnp.flip(enc_outs_arr, axis=0)
             if n_dec_skipless > 0:
                 zero_pad = jnp.zeros(
                     (n_dec_skipless,) + enc_outs_flipped.shape[1:],
                     dtype=enc_outs_flipped.dtype,
                 )
-                skip_for_dec_arr = jnp.concatenate([zero_pad, enc_outs_flipped], axis=0)
+                skip_for_dec_full = jnp.concatenate([zero_pad, enc_outs_flipped], axis=0)
             else:
-                skip_for_dec_arr = enc_outs_flipped
-            # Re-name leading axis to dec_layer for scan slicing.
-            skip_for_dec = hax.named(skip_for_dec_arr, (DecAxis,) + tuple(enc_outs.axes[1:]))
+                skip_for_dec_full = enc_outs_flipped
+            sw_full = self.skip_weights.array
+            sg_full = self.skip_gate_logits.array
 
             def dec_step(block, carry, *, mask, key, pos_ids, x0, skip, sw, sg):
                 gate = hnn.sigmoid(sg)
@@ -727,14 +792,36 @@ class MockingbirdTransformer(eqx.Module):
                 carry = block(carry, mask=mask, key=key, pos_ids=pos_ids, x0=x0)
                 return carry, carry
 
-            x, _ = self.dec_layers.scan_via(dec_step)(
-                x, mask=attn_mask, key=keys_dec, pos_ids=pos_ids, x0=x0,
-                skip=skip_for_dec, sw=self.skip_weights, sg=self.skip_gate_logits,
-            )
+            inner_axes = tuple(enc_outs.axes[1:])
+
+            if self.dec_reg_layers is not None:
+                DecRegAxis = self.dec_reg_layers.Block
+                skip_reg = hax.named(skip_for_dec_full[:n_dec_reg], (DecRegAxis,) + inner_axes)
+                sw_reg = hax.named(sw_full[:n_dec_reg], (DecRegAxis,))
+                sg_reg = hax.named(sg_full[:n_dec_reg], (DecRegAxis,))
+                x, _ = self.dec_reg_layers.scan_via(dec_step)(
+                    x, mask=attn_mask, key=keys_dec_reg, pos_ids=pos_ids, x0=x0,
+                    skip=skip_reg, sw=sw_reg, sg=sg_reg,
+                )
+
+            if self.dec_par_layers is not None:
+                DecParAxis = self.dec_par_layers.Block
+                skip_par = hax.named(skip_for_dec_full[n_dec_reg:], (DecParAxis,) + inner_axes)
+                sw_par = hax.named(sw_full[n_dec_reg:], (DecParAxis,))
+                sg_par = hax.named(sg_full[n_dec_reg:], (DecParAxis,))
+                x, _ = self.dec_par_layers.scan_via(dec_step)(
+                    x, mask=attn_mask, key=keys_dec_par, pos_ids=pos_ids, x0=x0,
+                    skip=skip_par, sw=sw_par, sg=sg_par,
+                )
         else:
-            x = cast(NamedArray, self.dec_layers.fold(
-                x, mask=attn_mask, key=keys_dec, pos_ids=pos_ids, x0=x0
-            ))
+            if self.dec_reg_layers is not None:
+                x = cast(NamedArray, self.dec_reg_layers.fold(
+                    x, mask=attn_mask, key=keys_dec_reg, pos_ids=pos_ids, x0=x0
+                ))
+            if self.dec_par_layers is not None:
+                x = cast(NamedArray, self.dec_par_layers.fold(
+                    x, mask=attn_mask, key=keys_dec_par, pos_ids=pos_ids, x0=x0
+                ))
 
         x = self.final_norm(x)
         return x
