@@ -222,10 +222,15 @@ class MockingbirdConfig(LmConfig):
         assert self.num_heads % self.num_kv_heads == 0, (
             f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
         )
-        if self.enable_looping:
-            assert 0 <= self.loop_start <= self.loop_end < self.num_layers, (
-                f"Invalid loop range [{self.loop_start}, {self.loop_end}] for num_layers={self.num_layers}."
-            )
+        # Enc/loop/dec must all have at least one layer for the 3-Stacked split.
+        # loop_start and loop_end define the [closed, closed] loop range.
+        assert 0 < self.loop_start, (
+            f"loop_start={self.loop_start} must be > 0 (need at least one encoder layer)."
+        )
+        assert self.loop_start <= self.loop_end < self.num_layers - 1, (
+            f"Invalid loop range [{self.loop_start}, {self.loop_end}] for num_layers={self.num_layers} "
+            f"(need at least one decoder layer)."
+        )
 
     @property
     def Pos(self) -> Axis:
@@ -509,46 +514,110 @@ class MockingbirdBlock(eqx.Module):
 
 
 class MockingbirdTransformer(eqx.Module):
+    """Mockingbird custom transformer skeleton.
+
+    Three Stacked groups split the layer index range into encoder / looped middle /
+    decoder. The looped middle re-runs ``num_loops + 1`` times when looping is on,
+    sharing parameters across reps (the PG hallmark). U-Net skips, smear gate,
+    and parallel lanes are added in subsequent Phase-2 iterations.
+
+    Layer index split:
+        encoder: [0, loop_start)            ─── n_enc layers
+        loop:    [loop_start, loop_end]     ─── n_loop layers (re-run num_loops+1 times)
+        decoder: (loop_end, num_layers)     ─── n_dec layers
+    """
+
     config: MockingbirdConfig = eqx.field(static=True)
-    layers: BlockFoldable[MockingbirdBlock]
+    enc_layers: BlockFoldable[MockingbirdBlock]
+    loop_layers: BlockFoldable[MockingbirdBlock]
+    dec_layers: BlockFoldable[MockingbirdBlock]
     final_norm: hnn.RmsNorm
-    # RmsNorm applied to the embedding output BEFORE the layer stack, used both
-    # as the layer-stack carry initial value and as the resid_mix x0 constant.
-    # Optional so configs can disable it without changing the signature.
     embed_norm: Optional[hnn.RmsNorm]
 
     @staticmethod
     def init(config: MockingbirdConfig, *, key) -> "MockingbirdTransformer":
-        S = Stacked if config.scan_layers else BlockSeq
-        # Precompute per-layer ln_scale_factor outside vmap; vmap slices each
-        # block's init to its own scalar. Disabled => 1.0 (no-op multiplier).
+        n_enc = config.loop_start
+        n_loop = config.loop_end - config.loop_start + 1
+        n_dec = config.num_layers - config.loop_end - 1
+
+        # Precompute per-layer ln_scale_factor across the FULL contiguous index
+        # range (encoder gets 0..n_enc-1, loop gets n_enc..n_enc+n_loop-1, etc.).
+        # Note: every loop rep reuses the same ln_factors[loop_range] — that's
+        # the looped-middle parameter-sharing semantics.
         idx = jnp.arange(config.num_layers, dtype=jnp.float32)
         if config.ln_scale:
-            ln_scale_factors = 1.0 / jnp.sqrt(idx + 1.0)
+            ln_factors = 1.0 / jnp.sqrt(idx + 1.0)
         else:
-            ln_scale_factors = jnp.ones(config.num_layers, dtype=jnp.float32)
-        layers = S.init(config.Layers, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
-            config,
-            ln_scale_factors,
-            key=shaped_rng_split(key, config.num_layers),
+            ln_factors = jnp.ones(config.num_layers, dtype=jnp.float32)
+        enc_factors = ln_factors[:n_enc]
+        loop_factors = ln_factors[n_enc : n_enc + n_loop]
+        dec_factors = ln_factors[n_enc + n_loop :]
+
+        S = Stacked if config.scan_layers else BlockSeq
+        EncAxis = Axis("enc_layer", n_enc)
+        LoopAxis = Axis("loop_layer", n_loop)
+        DecAxis = Axis("dec_layer", n_dec)
+
+        k_enc, k_loop, k_dec = jrandom.split(key, 3)
+
+        enc_layers = S.init(EncAxis, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
+            config, enc_factors, key=shaped_rng_split(k_enc, n_enc),
         )
+        loop_layers = S.init(LoopAxis, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
+            config, loop_factors, key=shaped_rng_split(k_loop, n_loop),
+        )
+        dec_layers = S.init(DecAxis, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
+            config, dec_factors, key=shaped_rng_split(k_dec, n_dec),
+        )
+
         final_norm = config.mk_LayerNorm(config.Embed)
         embed_norm = config.mk_LayerNorm(config.Embed) if config.embed_norm else None
-        return MockingbirdTransformer(config, layers, final_norm, embed_norm)
+        return MockingbirdTransformer(
+            config, enc_layers, loop_layers, dec_layers, final_norm, embed_norm
+        )
 
     @named_call
     def __call__(
-        self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], *, key, pos_ids: NamedArray | None = None
+        self,
+        x: NamedArray,
+        attn_mask: Optional[NamedArray | AttentionMask],
+        *,
+        key,
+        pos_ids: NamedArray | None = None,
     ) -> NamedArray:
-        keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
-        # x0 is the post-norm embedding, threaded as a constant through the fold
+        n_enc = self.config.loop_start
+        n_loop = self.config.loop_end - self.config.loop_start + 1
+        n_dec = self.config.num_layers - self.config.loop_end - 1
+
+        if key is not None:
+            k_enc, k_loop, k_dec = jrandom.split(key, 3)
+            keys_enc = maybe_rng_split(k_enc, n_enc)
+            keys_loop = maybe_rng_split(k_loop, n_loop)
+            keys_dec = maybe_rng_split(k_dec, n_dec)
+        else:
+            keys_enc = keys_loop = keys_dec = None
+
+        # x0 = post-norm embedding, broadcast to every block via fold kwargs
         # so each block's resid_mix can mix the original embedding back in.
         if self.embed_norm is not None:
             x = self.embed_norm(x)
         x0 = x
-        # TODO(Phase 2): replace single-pass fold with the encoder/looped-middle/
-        # decoder skeleton (smear gate, U-Net skips, parallel lanes).
-        x = cast(NamedArray, self.layers.fold(x, mask=attn_mask, key=keys, pos_ids=pos_ids, x0=x0))
+
+        # Encoder
+        x = cast(NamedArray, self.enc_layers.fold(x, mask=attn_mask, key=keys_enc, pos_ids=pos_ids, x0=x0))
+
+        # Looped middle: same params run num_loops+1 times when looping is on.
+        # Static Python loop traces num_reps invocations into the JAX graph.
+        n_reps = self.config.num_loops + 1 if self.config.enable_looping else 1
+        for _ in range(n_reps):
+            x = cast(
+                NamedArray,
+                self.loop_layers.fold(x, mask=attn_mask, key=keys_loop, pos_ids=pos_ids, x0=x0),
+            )
+
+        # Decoder (no skips yet — Phase 2b)
+        x = cast(NamedArray, self.dec_layers.fold(x, mask=attn_mask, key=keys_dec, pos_ids=pos_ids, x0=x0))
+
         x = self.final_norm(x)
         return x
 

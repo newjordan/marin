@@ -34,7 +34,8 @@ mockingbird_small = MockingbirdConfig(
     qk_gain=5.25,
     loop_start=2,
     loop_end=3,
-    enable_looping=False,
+    num_loops=2,           # 3 effective reps over loop_layers when enabled
+    enable_looping=True,   # Phase 2a — exercise the looped-middle mechanic
 )
 
 tinystories_hf_id = "roneneldan/TinyStories"
