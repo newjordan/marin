@@ -185,6 +185,10 @@ class MockingbirdConfig(LmConfig):
     embed_norm: bool = True  # RmsNorm on embedding output before threading as x0 + carry
     use_unet_skips: bool = True  # decoder layers lerp(x, skip_w*skip_enc, sigmoid(skip_g))
     skip_gate_logit_init: float = -5.0  # sigmoid(-5) ~= 0.007 -> tiny initial skip contribution
+    use_xsa: bool = True  # orthogonal value projection on attn output (Mockingbird XSA)
+    sparse_attn_gate_enabled: bool = True  # per-head sigmoid gate on attn output from x[:gate_window]
+    sparse_attn_gate_scale: float = 0.5  # scale on the gate logits before sigmoid
+    gate_window: int = 12  # first gate_window dims of x feed the sparse_attn_gate (and smear gate)
 
     # Structural / Phase-2 features (parsed; wired by the custom transformer skeleton).
     loop_start: int = 3
@@ -390,15 +394,35 @@ class MockingbirdAttention(Attention):
     # Defaults to None to satisfy dataclass field ordering (parent has defaulted
     # fields). init() always supplies the actual Param.
     per_head_qk_gain: Optional[NamedArray] = None
+    # Sparse attn gate: per-head W_g of shape (KVHeads, QHeadsPerGroup, GateWindow).
+    # When set, the per-head gate sigmoid(scale * W_g @ x[:gate_window]) multiplies
+    # attn output post-XSA, pre-out_proj. Init to zeros so initial gate=0.5 (PG ref).
+    sparse_attn_gate_w: Optional[NamedArray] = None
+    # Static knobs passed through from the model config.
+    sparse_attn_gate_scale: float = eqx.field(static=True, default=0.5)
+    gate_window: int = eqx.field(static=True, default=12)
+    use_xsa: bool = eqx.field(static=True, default=False)
 
     @staticmethod
     def init(
-        config: AttentionConfig, qk_gain_init: float, *, key
+        config: AttentionConfig,
+        qk_gain_init: float,
+        *,
+        key,
+        sparse_attn_gate_enabled: bool = False,
+        sparse_attn_gate_scale: float = 0.5,
+        gate_window: int = 12,
+        use_xsa: bool = False,
     ) -> "MockingbirdAttention":
         base = Attention.init(config, key=key)
         per_head_qk_gain = hax.full(
             (config.KVHeads, config.QHeadsPerGroup), qk_gain_init
         )
+        if sparse_attn_gate_enabled:
+            GW = Axis("gate_window", gate_window)
+            sparse_attn_gate_w = hax.zeros((config.KVHeads, config.QHeadsPerGroup, GW))
+        else:
+            sparse_attn_gate_w = None
         return MockingbirdAttention(
             base.config,
             base.q_proj,
@@ -409,6 +433,10 @@ class MockingbirdAttention(Attention):
             base.k_norm,
             base.rot_embs,
             per_head_qk_gain,
+            sparse_attn_gate_w,
+            sparse_attn_gate_scale,
+            gate_window,
+            use_xsa,
         )
 
     @named_call
@@ -453,6 +481,34 @@ class MockingbirdAttention(Attention):
             inference=True,
             prng=key,
         )
+
+        # XSA: subtract the head_size-direction component of attn_output that's
+        # parallel to the (normalized) value vector for the same kv_head/position.
+        # v is naturally shared across q_heads_per_group (GQA); we must explicitly
+        # broadcast it to that axis so the per-projection multiply can use the
+        # haliax subset-broadcast rule both ways.
+        if self.use_xsa:
+            HeadSize = attn_output.resolve_axis("head_size")
+            QHG = attn_output.resolve_axis("q_heads_per_group")
+            v_inv_norm = hax.rsqrt((v * v).sum(HeadSize) + 1e-6)
+            v_norm = v * v_inv_norm
+            # Align key_position -> position and add q_heads_per_group via broadcast.
+            v_norm_aligned = v_norm.rename({"key_position": "position"}).broadcast_axis(QHG)
+            dot = (attn_output * v_norm_aligned).sum(HeadSize)
+            proj = dot * v_norm_aligned
+            attn_output = attn_output - proj
+
+        # Sparse attn gate: per-head sigmoid(scale * W_g @ x[:gate_window]) on attn_output.
+        # gate_in axes (..., position, gate_window) and W_g axes (kv_head, q_heads_per_group,
+        # gate_window) share only gate_window — use hax.dot to contract on it cleanly.
+        if self.sparse_attn_gate_w is not None:
+            Embed = self.config.Embed
+            GW = self.sparse_attn_gate_w.resolve_axis("gate_window")
+            gate_in = x[Embed, : self.gate_window].rename({Embed.name: GW.name})
+            gate_logits = hax.dot(gate_in, self.sparse_attn_gate_w, axis=GW) * self.sparse_attn_gate_scale
+            gate = hnn.sigmoid(gate_logits)
+            attn_output = attn_output * gate
+
         attn_output = attn_output.flatten_axes(("kv_head", "q_heads_per_group"), "heads")
         attn_output = attn_output.astype(x.dtype)
         return self.o_proj(attn_output, key=key_o)
@@ -490,7 +546,15 @@ class MockingbirdBlock(eqx.Module):
     def init(config: MockingbirdConfig, ln_scale_factor: jax.Array, *, key) -> "MockingbirdBlock":
         k_attn, k_mlp = jrandom.split(key, 2)
         attn_config = config.attention_config()
-        attn = MockingbirdAttention.init(attn_config, qk_gain_init=config.qk_gain, key=k_attn)
+        attn = MockingbirdAttention.init(
+            attn_config,
+            qk_gain_init=config.qk_gain,
+            key=k_attn,
+            sparse_attn_gate_enabled=config.sparse_attn_gate_enabled,
+            sparse_attn_gate_scale=config.sparse_attn_gate_scale,
+            gate_window=config.gate_window,
+            use_xsa=config.use_xsa,
+        )
         mlp = MockingbirdMlp.init(
             config.Embed,
             config.Mlp,
