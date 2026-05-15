@@ -183,6 +183,8 @@ class MockingbirdConfig(LmConfig):
     ln_scale: bool = True  # multiply norm output by 1/sqrt(layer_idx+1); reference: ON
     use_resid_mix: bool = True  # per-block (2,dim) Param: x_in = mix[0]*x + mix[1]*x0
     embed_norm: bool = True  # RmsNorm on embedding output before threading as x0 + carry
+    use_unet_skips: bool = True  # decoder layers lerp(x, skip_w*skip_enc, sigmoid(skip_g))
+    skip_gate_logit_init: float = -5.0  # sigmoid(-5) ~= 0.007 -> tiny initial skip contribution
 
     # Structural / Phase-2 features (parsed; wired by the custom transformer skeleton).
     loop_start: int = 3
@@ -533,12 +535,19 @@ class MockingbirdTransformer(eqx.Module):
     dec_layers: BlockFoldable[MockingbirdBlock]
     final_norm: hnn.RmsNorm
     embed_norm: Optional[hnn.RmsNorm]
+    # U-Net skip Params, axis ("dec_layer", n_dec).
+    # First n_dec_skipless slots stay dormant (zero gradient) because the
+    # corresponding skip slice is also zero — see __call__'s skip_for_dec build.
+    skip_weights: Optional[NamedArray]
+    skip_gate_logits: Optional[NamedArray]
 
     @staticmethod
     def init(config: MockingbirdConfig, *, key) -> "MockingbirdTransformer":
         n_enc = config.loop_start
         n_loop = config.loop_end - config.loop_start + 1
         n_dec = config.num_layers - config.loop_end - 1
+        n_skip_pairs = min(n_enc, n_dec) if config.use_unet_skips else 0
+        n_dec_skipless = n_dec - n_skip_pairs
 
         # Precompute per-layer ln_scale_factor across the FULL contiguous index
         # range (encoder gets 0..n_enc-1, loop gets n_enc..n_enc+n_loop-1, etc.).
@@ -570,10 +579,27 @@ class MockingbirdTransformer(eqx.Module):
             config, dec_factors, key=shaped_rng_split(k_dec, n_dec),
         )
 
+        if config.use_unet_skips and n_skip_pairs > 0:
+            # Per-decoder-layer Params; skipless slots init at "off" sentinel.
+            sw = jnp.concatenate([
+                jnp.zeros(n_dec_skipless, dtype=jnp.float32),
+                jnp.ones(n_skip_pairs, dtype=jnp.float32),
+            ])
+            sg = jnp.concatenate([
+                jnp.full(n_dec_skipless, -100.0, dtype=jnp.float32),
+                jnp.full(n_skip_pairs, config.skip_gate_logit_init, dtype=jnp.float32),
+            ])
+            skip_weights = hax.named(sw, (DecAxis,))
+            skip_gate_logits = hax.named(sg, (DecAxis,))
+        else:
+            skip_weights = None
+            skip_gate_logits = None
+
         final_norm = config.mk_LayerNorm(config.Embed)
         embed_norm = config.mk_LayerNorm(config.Embed) if config.embed_norm else None
         return MockingbirdTransformer(
-            config, enc_layers, loop_layers, dec_layers, final_norm, embed_norm
+            config, enc_layers, loop_layers, dec_layers, final_norm, embed_norm,
+            skip_weights, skip_gate_logits,
         )
 
     @named_call
@@ -603,11 +629,27 @@ class MockingbirdTransformer(eqx.Module):
             x = self.embed_norm(x)
         x0 = x
 
-        # Encoder
-        x = cast(NamedArray, self.enc_layers.fold(x, mask=attn_mask, key=keys_enc, pos_ids=pos_ids, x0=x0))
+        # ─── Encoder ────────────────────────────────────────────────────────
+        # When U-Net skips are on, we need each encoder layer's output for the
+        # decoder to consume. scan_via returns (final_carry, stacked_outputs)
+        # along the EncAxis. When skips are off, fold is sufficient and lighter.
+        if self.skip_weights is not None:
+            def enc_step(block, carry, *, mask, key, pos_ids, x0):
+                carry = block(carry, mask=mask, key=key, pos_ids=pos_ids, x0=x0)
+                return carry, carry
 
-        # Looped middle: same params run num_loops+1 times when looping is on.
-        # Static Python loop traces num_reps invocations into the JAX graph.
+            x, enc_outs = self.enc_layers.scan_via(enc_step)(
+                x, mask=attn_mask, key=keys_enc, pos_ids=pos_ids, x0=x0
+            )
+        else:
+            enc_outs = None
+            x = cast(NamedArray, self.enc_layers.fold(
+                x, mask=attn_mask, key=keys_enc, pos_ids=pos_ids, x0=x0
+            ))
+
+        # ─── Looped middle ──────────────────────────────────────────────────
+        # Same params run num_loops+1 times when looping is on. Static Python
+        # loop traces num_reps invocations into the JAX graph.
         n_reps = self.config.num_loops + 1 if self.config.enable_looping else 1
         for _ in range(n_reps):
             x = cast(
@@ -615,8 +657,42 @@ class MockingbirdTransformer(eqx.Module):
                 self.loop_layers.fold(x, mask=attn_mask, key=keys_loop, pos_ids=pos_ids, x0=x0),
             )
 
-        # Decoder (no skips yet — Phase 2b)
-        x = cast(NamedArray, self.dec_layers.fold(x, mask=attn_mask, key=keys_dec, pos_ids=pos_ids, x0=x0))
+        # ─── Decoder ────────────────────────────────────────────────────────
+        if self.skip_weights is not None and enc_outs is not None:
+            # Build skip_for_dec aligned with decoder iteration order:
+            #   first n_dec_skipless slots = zero (no skip),
+            #   last n_skip_pairs slots    = enc_outs reversed (last enc -> first paired dec).
+            n_skip_pairs = min(n_enc, n_dec)
+            n_dec_skipless = n_dec - n_skip_pairs
+            DecAxis = self.dec_layers.Block
+            # Reverse along EncAxis via underlying jnp; rename axis to dec_layer.
+            enc_outs_arr = enc_outs.array  # axes: (enc_layer, ..., position, embed)
+            enc_outs_flipped = jnp.flip(enc_outs_arr, axis=0)
+            if n_dec_skipless > 0:
+                zero_pad = jnp.zeros(
+                    (n_dec_skipless,) + enc_outs_flipped.shape[1:],
+                    dtype=enc_outs_flipped.dtype,
+                )
+                skip_for_dec_arr = jnp.concatenate([zero_pad, enc_outs_flipped], axis=0)
+            else:
+                skip_for_dec_arr = enc_outs_flipped
+            # Re-name leading axis to dec_layer for scan slicing.
+            skip_for_dec = hax.named(skip_for_dec_arr, (DecAxis,) + tuple(enc_outs.axes[1:]))
+
+            def dec_step(block, carry, *, mask, key, pos_ids, x0, skip, sw, sg):
+                gate = hnn.sigmoid(sg)
+                carry = (1.0 - gate) * carry + gate * (skip * sw)
+                carry = block(carry, mask=mask, key=key, pos_ids=pos_ids, x0=x0)
+                return carry, carry
+
+            x, _ = self.dec_layers.scan_via(dec_step)(
+                x, mask=attn_mask, key=keys_dec, pos_ids=pos_ids, x0=x0,
+                skip=skip_for_dec, sw=self.skip_weights, sg=self.skip_gate_logits,
+            )
+        else:
+            x = cast(NamedArray, self.dec_layers.fold(
+                x, mask=attn_mask, key=keys_dec, pos_ids=pos_ids, x0=x0
+            ))
 
         x = self.final_norm(x)
         return x
