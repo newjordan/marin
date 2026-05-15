@@ -69,8 +69,24 @@ Verify: CPU smoke + shape/structure checks vs reference.
 `MODEL_CONFIG`; smoke on the rented GPU box (box 1, ssh1:17246). Confirm Muon optimizer
 config. Then the CaseOps triangle runs on true Mockingbird.
 
-## Current state (2026-05-15)
-- `lib/levanter/src/levanter/models/mockingbird.py` exists, ~20% done (Phase-1 partial:
-  leaky_relu², per-block scales, RMSNorm, scalar QK gain). Smoke-verified on CPU/TinyStories.
-- Box 1 (vast.ai A100, instance 36777247, ssh1:17246) kept alive as GPU dev box.
-- Boxes 2 & 3 destroyed (were idle).
+## Current state (2026-05-15, EOD)
+- `lib/levanter/src/levanter/models/mockingbird.py` — Phase 1-4 COMPLETE.
+  All architecture features from PG 2026-05-01 reference ported and GPU-verified.
+  Branch `mockingbird-baseline` pushed to `origin` (newjordan/marin); HEAD `178ba0761`.
+- Phase-4 preflight (mockingbird_150m, 200 steps on TinyStories): bpb 1.17, loss 3.33,
+  4.1 it/s on RTX PRO 6000.
+- Active box: Texas RTX PRO 6000 instance 36820913 (`ssh -p 20912 root@ssh4.vast.ai`).
+
+## To plug Mockingbird into the actual CaseOps triangle
+Edit `experiments/speedrun/caseops/caseops_sweep.py`:
+
+```python
+# from experiments.llama import llama_150m
+# MODEL_CONFIG = llama_150m
+from experiments.private.mockingbird_caseops_preflight import mockingbird_150m
+MODEL_CONFIG = mockingbird_150m
+```
+
+Optimizer-side: caseops_sweep currently uses SimpleTrainConfig defaults (AdamW).
+Muon-on-Mockingbird is a separate follow-up — Levanter has Muon at
+`lib/levanter/src/levanter/optim/muon.py`, `muonh.py`, `grugmuon.py`.
