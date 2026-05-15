@@ -181,6 +181,8 @@ class MockingbirdConfig(LmConfig):
     use_attn_scale: bool = True  # per-block per-dim learnable gain on attn residual
     use_mlp_scale: bool = True  # per-block per-dim learnable gain on mlp residual
     ln_scale: bool = True  # multiply norm output by 1/sqrt(layer_idx+1); reference: ON
+    use_resid_mix: bool = True  # per-block (2,dim) Param: x_in = mix[0]*x + mix[1]*x0
+    embed_norm: bool = True  # RmsNorm on embedding output before threading as x0 + carry
 
     # Structural / Phase-2 features (parsed; wired by the custom transformer skeleton).
     loop_start: int = 3
@@ -412,7 +414,8 @@ class MockingbirdAttention(Attention):
 
 
 class MockingbirdBlock(eqx.Module):
-    """Pre-norm transformer block with per-block per-dim attn/mlp residual scales.
+    """Pre-norm transformer block with per-block per-dim attn/mlp residual scales
+    and per-layer ln_scale_factor (1/sqrt(layer_idx+1)) on norm output.
 
     Reference block forward (train_gpt.py line 1232):
         attn_out = attn(attn_norm(x) * ln_scale_factor)
@@ -420,8 +423,8 @@ class MockingbirdBlock(eqx.Module):
         mlp_out = mlp(mlp_norm(x) * ln_scale_factor)
         x = x + mlp_scale * mlp_out
 
-    NOTE: resid_mix (mix of current x with embedding x0) is NOT yet plumbed; would require
-    threading x0 through the scan-friendly layer signature. TODO once smoke is green.
+    NOTE: resid_mix (mix of current x with embedding x0) still pending — needs x0
+    threaded as a fold kwarg from MockingbirdTransformer.__call__.
     """
 
     config: MockingbirdConfig = eqx.field(static=True)
@@ -431,9 +434,15 @@ class MockingbirdBlock(eqx.Module):
     mlp_norm: hnn.RmsNorm
     attn_scale: Optional[NamedArray]
     mlp_scale: Optional[NamedArray]
+    # Precomputed per-layer scalar (1/sqrt(layer_idx+1) when ln_scale else 1.0).
+    # Vmap-sliced from a (num_layers,) array passed by MockingbirdTransformer.init.
+    ln_scale_factor: jax.Array
+    # Per-block (mix_idx=2, embed) Param: x_in = mix[0]*x + mix[1]*x0.
+    # Init to (1.0, 0.0) so first-step behavior is x_in = x (identity).
+    resid_mix: Optional[NamedArray]
 
     @staticmethod
-    def init(config: MockingbirdConfig, *, key) -> "MockingbirdBlock":
+    def init(config: MockingbirdConfig, ln_scale_factor: jax.Array, *, key) -> "MockingbirdBlock":
         k_attn, k_mlp = jrandom.split(key, 2)
         attn_config = config.attention_config()
         attn = MockingbirdAttention.init(attn_config, qk_gain_init=config.qk_gain, key=k_attn)
@@ -449,7 +458,20 @@ class MockingbirdBlock(eqx.Module):
         # Per-dim learnable scalar gains, initialized to ones.
         attn_scale = hax.ones(config.Embed) if config.use_attn_scale else None
         mlp_scale = hax.ones(config.Embed) if config.use_mlp_scale else None
-        return MockingbirdBlock(config, attn, mlp, attn_norm, mlp_norm, attn_scale, mlp_scale)
+        if config.use_resid_mix:
+            MixIdx = Axis("mix_idx", 2)
+            init_data = jnp.stack(
+                [jnp.ones(config.hidden_dim, dtype=jnp.float32),
+                 jnp.zeros(config.hidden_dim, dtype=jnp.float32)],
+                axis=0,
+            )
+            resid_mix = hax.named(init_data, (MixIdx, config.Embed))
+        else:
+            resid_mix = None
+        return MockingbirdBlock(
+            config, attn, mlp, attn_norm, mlp_norm, attn_scale, mlp_scale,
+            ln_scale_factor, resid_mix,
+        )
 
     @named_call
     def __call__(
@@ -459,13 +481,18 @@ class MockingbirdBlock(eqx.Module):
         *,
         key=None,
         pos_ids: NamedArray | None = None,
+        x0: NamedArray | None = None,
     ) -> NamedArray:
         k_attn, k_mlp = maybe_rng_split(key, 2)
 
+        # resid_mix: x_in = mix[0]*x + mix[1]*x0  (x0 = post-norm embedding,
+        # threaded through the fold as a constant kwarg).
+        if self.resid_mix is not None and x0 is not None:
+            x = self.resid_mix["mix_idx", 0] * x + self.resid_mix["mix_idx", 1] * x0
+
         # Attention path
         residual = x
-        a = self.attn_norm(x)
-        # NOTE: ln_scale_factor (1/sqrt(layer_idx+1)) NOT yet wired — needs per-layer idx in scan.
+        a = self.attn_norm(x) * self.ln_scale_factor
         attn_out = self.self_attn(x=a, mask=mask, key=k_attn, pos_ids=pos_ids)
         if self.attn_scale is not None:
             attn_out = attn_out * self.attn_scale
@@ -473,7 +500,7 @@ class MockingbirdBlock(eqx.Module):
 
         # MLP path
         residual = x
-        m = self.mlp_norm(x)
+        m = self.mlp_norm(x) * self.ln_scale_factor
         mlp_out = self.mlp(m, key=k_mlp)
         if self.mlp_scale is not None:
             mlp_out = mlp_out * self.mlp_scale
@@ -485,25 +512,43 @@ class MockingbirdTransformer(eqx.Module):
     config: MockingbirdConfig = eqx.field(static=True)
     layers: BlockFoldable[MockingbirdBlock]
     final_norm: hnn.RmsNorm
+    # RmsNorm applied to the embedding output BEFORE the layer stack, used both
+    # as the layer-stack carry initial value and as the resid_mix x0 constant.
+    # Optional so configs can disable it without changing the signature.
+    embed_norm: Optional[hnn.RmsNorm]
 
     @staticmethod
     def init(config: MockingbirdConfig, *, key) -> "MockingbirdTransformer":
         S = Stacked if config.scan_layers else BlockSeq
+        # Precompute per-layer ln_scale_factor outside vmap; vmap slices each
+        # block's init to its own scalar. Disabled => 1.0 (no-op multiplier).
+        idx = jnp.arange(config.num_layers, dtype=jnp.float32)
+        if config.ln_scale:
+            ln_scale_factors = 1.0 / jnp.sqrt(idx + 1.0)
+        else:
+            ln_scale_factors = jnp.ones(config.num_layers, dtype=jnp.float32)
         layers = S.init(config.Layers, MockingbirdBlock, gradient_checkpointing=config.gradient_checkpointing)(
             config,
+            ln_scale_factors,
             key=shaped_rng_split(key, config.num_layers),
         )
         final_norm = config.mk_LayerNorm(config.Embed)
-        return MockingbirdTransformer(config, layers, final_norm)
+        embed_norm = config.mk_LayerNorm(config.Embed) if config.embed_norm else None
+        return MockingbirdTransformer(config, layers, final_norm, embed_norm)
 
     @named_call
     def __call__(
         self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], *, key, pos_ids: NamedArray | None = None
     ) -> NamedArray:
         keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
-        # TODO(loop): when enable_looping=True and current step >= enable_looping_at fraction,
-        # split into pre/loop/post and run loop block num_loops+1 times. For now: single pass.
-        x = cast(NamedArray, self.layers.fold(x, mask=attn_mask, key=keys, pos_ids=pos_ids))
+        # x0 is the post-norm embedding, threaded as a constant through the fold
+        # so each block's resid_mix can mix the original embedding back in.
+        if self.embed_norm is not None:
+            x = self.embed_norm(x)
+        x0 = x
+        # TODO(Phase 2): replace single-pass fold with the encoder/looped-middle/
+        # decoder skeleton (smear gate, U-Net skips, parallel lanes).
+        x = cast(NamedArray, self.layers.fold(x, mask=attn_mask, key=keys, pos_ids=pos_ids, x0=x0))
         x = self.final_norm(x)
         return x
 
